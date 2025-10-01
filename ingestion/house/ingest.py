@@ -160,7 +160,7 @@ def has_excluded_token(row_values: List[str]) -> bool:
 def parse_action(s: str) -> str:
     t = (s or "").strip().lower()
     # normalize variants
-    t = t.replace("purchase", "buy").replace("sale", "sell")
+    t = t.replace("p", "buy").replace("s", "sell").replace("s (partial)", "sell")
     for a in TRADE_ACTIONS:
         if a in t:
             return a.capitalize()
