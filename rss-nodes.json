@@ -1,0 +1,246 @@
+{
+  "name": "Multi-Target TruthSocial & X Scraper",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "When clicking ‘Execute workflow’",
+      "type": "n8n-nodes-base.manualTrigger",
+      "position": [-160, 0],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "rule": { "interval": [ { "field": "weeks" } ] }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [-160, 200],
+      "typeVersion": 1.2
+    },
+    {
+      "parameters": {
+        "values": {
+          "json": [
+            {
+              "name": "targets",
+              "value": {
+                "items": [
+                  { "category": "Senate", "name": "Banks (IN)", "role": "Senator" },
+                  { "category": "Senate", "name": "Barrasso (WY)", "role": "Senator" },
+                  { "category": "Senate", "name": "Blackburn (TN)", "role": "Senator" },
+                  { "category": "Senate", "name": "Boozman (AR)", "role": "Senator" },
+                  { "category": "Senate", "name": "Britt (AL)", "role": "Senator" },
+                  { "category": "Senate", "name": "Budd (NC)", "role": "Senator" },
+                  { "category": "Senate", "name": "Capito (WV)", "role": "Senator" },
+                  { "category": "Senate", "name": "Cassidy (LA)", "role": "Senator" },
+                  { "category": "Senate", "name": "Collins (ME)", "role": "Senator" },
+                  { "category": "Senate", "name": "Cornyn (TX)", "role": "Senator" },
+                  { "category": "Senate", "name": "Cotton (AR)", "role": "Senator" },
+                  { "category": "Senate", "name": "Cramer (ND)", "role": "Senator" },
+                  { "category": "Senate", "name": "Crapo (ID)", "role": "Senator" },
+                  { "category": "Senate", "name": "Cruz (TX)", "role": "Senator" },
+                  { "category": "Senate", "name": "Curtis (UT)", "role": "Senator" },
+                  { "category": "Senate", "name": "Daines (MT)", "role": "Senator" },
+                  { "category": "Senate", "name": "Ernst (IA)", "role": "Senator" },
+                  { "category": "Senate", "name": "Fischer (NE)", "role": "Senator" },
+                  { "category": "Senate", "name": "Graham (SC)", "role": "Senator" },
+                  { "category": "Senate", "name": "Grassley (IA)", "role": "Senator" },
+                  { "category": "Senate", "name": "Hagerty (TN)", "role": "Senator" },
+                  { "category": "Senate", "name": "Hoeven (ND)", "role": "Senator" },
+                  { "category": "Senate", "name": "Husted (OH)", "role": "Senator" },
+                  { "category": "Senate", "name": "Hyde-Smith (MS)", "role": "Senator" },
+                  { "category": "Senate", "name": "Johnson (WI)", "role": "Senator" },
+                  { "category": "Senate", "name": "Justice (WV)", "role": "Senator" },
+                  { "category": "Senate", "name": "Kennedy (LA)", "role": "Senator" },
+                  { "category": "Senate", "name": "Lankford (OK)", "role": "Senator" },
+                  { "category": "Senate", "name": "Lee (UT)", "role": "Senator" },
+                  { "category": "Senate", "name": "Lummis (WY)", "role": "Senator" },
+                  { "category": "Senate", "name": "Marshall (KS)", "role": "Senator" },
+                  { "category": "Senate", "name": "McConnell (KY)", "role": "Senator" },
+                  { "category": "Senate", "name": "McCormick (PA)", "role": "Senator" },
+                  { "category": "Senate", "name": "Moody (FL)", "role": "Senator" },
+                  { "category": "Senate", "name": "Moran (KS)", "role": "Senator" },
+                  { "category": "Senate", "name": "Moreno (OH)", "role": "Senator" },
+                  { "category": "Senate", "name": "Mullin (OK)", "role": "Senator" },
+                  { "category": "Senate", "name": "Murkowski (AK)", "role": "Senator" },
+                  { "category": "Senate", "name": "Ricketts (NE)", "role": "Senator" },
+                  { "category": "Senate", "name": "Risch (ID)", "role": "Senator" },
+                  { "category": "Senate", "name": "Rounds (SD)", "role": "Senator" },
+                  { "category": "Senate", "name": "Schmitt (MO)", "role": "Senator" },
+                  { "category": "Senate", "name": "Scott (FL)", "role": "Senator" },
+                  { "category": "Senate", "name": "Scott (SC)", "role": "Senator" },
+                  { "category": "Senate", "name": "Sheehy (MT)", "role": "Senator" },
+                  { "category": "Senate", "name": "Sullivan (AK)", "role": "Senator" },
+                  { "category": "Senate", "name": "Thune (SD)", "role": "Senator" },
+                  { "category": "Senate", "name": "Tillis (NC)", "role": "Senator" },
+                  { "category": "Senate", "name": "Tuberville (AL)", "role": "Senator" },
+                  { "category": "Senate", "name": "Wicker (MS)", "role": "Senator" },
+                  { "category": "Senate", "name": "Young (IN)", "role": "Senator" },
+                  { "category": "Cabinet", "name": "Marco Rubio", "role": "State" },
+                  { "category": "Cabinet", "name": "Scott Bessent", "role": "Treasury" },
+                  { "category": "Cabinet", "name": "Pete Hegseth", "role": "Defense" },
+                  { "category": "Cabinet", "name": "Pam Bondi", "role": "Justice (Attorney General)" },
+                  { "category": "Cabinet", "name": "Kristi Noem", "role": "Homeland Security" },
+                  { "category": "Cabinet", "name": "Doug Burgum", "role": "Interior" },
+                  { "category": "Cabinet", "name": "Brooke Rollins", "role": "Agriculture" },
+                  { "category": "Cabinet", "name": "Howard Lutnick", "role": "Commerce" },
+                  { "category": "Cabinet", "name": "Lori Chavez-DeRemer", "role": "Labor" },
+                  { "category": "Cabinet", "name": "Robert F. Kennedy Jr.", "role": "Health & Human Services" },
+                  { "category": "Cabinet", "name": "Scott Turner", "role": "Housing & Urban Development" },
+                  { "category": "Cabinet", "name": "Sean Duffy", "role": "Transportation" },
+                  { "category": "Cabinet", "name": "Chris Wright", "role": "Energy" },
+                  { "category": "Cabinet", "name": "Linda McMahon", "role": "Education" },
+                  { "category": "Cabinet", "name": "Doug Collins", "role": "Veterans Affairs" },
+                  { "category": "Cabinet-level", "name": "Tulsi Gabbard", "role": "Director of National Intelligence" },
+                  { "category": "Cabinet-level", "name": "John Ratcliffe", "role": "CIA Director" },
+                  { "category": "Cabinet-level", "name": "Jamieson Greer", "role": "U.S. Trade Representative" },
+                  { "category": "Cabinet-level", "name": "Russell Vought", "role": "OMB Director" },
+                  { "category": "Cabinet-level", "name": "Lee Zeldin", "role": "EPA Administrator" },
+                  { "category": "Cabinet-level", "name": "Kelly Loeffler", "role": "SBA Administrator" },
+                  { "category": "Cabinet-level", "name": "Mike Waltz", "role": "U.N. Ambassador" },
+                  { "category": "Cabinet-level", "name": "Susie Wiles", "role": "White House Chief of Staff" },
+                  { "category": "Cabinet-level", "name": "J.D. Vance", "role": "Vice President" }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "id": "set-targets",
+      "name": "Set Targets",
+      "type": "n8n-nodes-base.set",
+      "position": [120, -80],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "profileName": "shortforge",
+        "saveProfileOnTermination": true,
+        "proxy": "integrated",
+        "proxyConfig": { "country": "US", "sticky": true }
+      },
+      "id": "create-session",
+      "name": "Create Airtop Session",
+      "type": "n8n-nodes-base.airtop",
+      "position": [320, -80],
+      "typeVersion": 1,
+      "credentials": { "airtopApi": { "id": "cbNgR8fuYahlGsRm", "name": "Airtop account" } }
+    },
+    {
+      "parameters": {
+        "functionCode": "const input = $json.targets.items;\nconst platforms = [\n  { platform: 'truthsocial', searchUrl: 'https://truthsocial.com/search?q=' },\n  { platform: 'x', searchUrl: 'https://x.com/search?q=', searchSuffix: '&f=user' }\n];\n\nconst out = [];\nfor (const t of input) {\n  for (const p of platforms) {\n    out.push({\n      json: { ...t, platform: p.platform, searchBase: p.searchUrl, searchSuffix: p.searchSuffix || '' }\n    });\n  }\n}\nreturn out;"
+      },
+      "id": "expand-platforms",
+      "name": "Expand to Platforms",
+      "type": "n8n-nodes-base.code",
+      "position": [520, -80],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "batchSize": 1
+      },
+      "id": "split-batches",
+      "name": "Split In Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "position": [720, -80],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "functionCode": "const q = encodeURIComponent($json.name);\nconst url = `${$json.searchBase}${q}${$json.searchSuffix || ''}`;\nreturn [{ json: { ...$json, targetUrl: url } }];"
+      },
+      "id": "build-url",
+      "name": "Build Target URL",
+      "type": "n8n-nodes-base.code",
+      "position": [920, -80],
+      "typeVersion": 2
+    },
+    {
+      "parameters": {
+        "resource": "window",
+        "url": "={{ $json.targetUrl }}",
+        "additionalFields": { "waitUntil": "load" }
+      },
+      "id": "create-browser",
+      "name": "Create Airtop Browser",
+      "type": "n8n-nodes-base.airtop",
+      "position": [1120, -80],
+      "typeVersion": 1,
+      "credentials": { "airtopApi": { "id": "cbNgR8fuYahlGsRm", "name": "Airtop account" } }
+    },
+    {
+      "parameters": {
+        "resource": "extraction",
+        "prompt": "You are viewing either Truth Social or X search results depending on {{ $json.platform }}.\\nGoal: find the official/primary account for the person '{{ $json.name }}' (role: {{ $json.role }}, category: {{ $json.category }}). Prefer verified accounts, the highest-follower account, and accounts matching the known state/office if present. Navigate into that profile. Then extract the 25 most recent posts.\\n\\nReturn JSON matching this schema (STRICT):\\n{ ... }",
+        "parseJsonOutput": true
+      },
+      "id": "extract-posts",
+      "name": "Extract and Analyze Posts",
+      "type": "n8n-nodes-base.airtop",
+      "position": [1340, -80],
+      "typeVersion": 1,
+      "credentials": { "airtopApi": { "id": "cbNgR8fuYahlGsRm", "name": "Airtop account" } }
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "output.posts"
+      },
+      "id": "split-out",
+      "name": "Split Out",
+      "type": "n8n-nodes-base.splitOut",
+      "position": [1560, -80],
+      "typeVersion": 1
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "operator": { "type": "string", "operation": "exists", "singleValue": true },
+              "leftValue": "={{ $json.post_text }}"
+            },
+            {
+              "operator": { "type": "string", "operation": "notEquals" },
+              "leftValue": "={{ $json.stock_market_impact.magnitude }}",
+              "rightValue": "None"
+            }
+          ]
+        }
+      },
+      "id": "filter",
+      "name": "Filter",
+      "type": "n8n-nodes-base.filter",
+      "position": [1780, -80],
+      "typeVersion": 2.2
+    },
+    {
+      "parameters": {
+        "operation": "terminate",
+        "sessionId": "={{ $('Create Airtop Session').item.json.sessionId }}"
+      },
+      "id": "terminate-session",
+      "name": "Terminate Airtop Session",
+      "type": "n8n-nodes-base.airtop",
+      "position": [2000, 100],
+      "typeVersion": 1,
+      "credentials": { "airtopApi": { "id": "cbNgR8fuYahlGsRm", "name": "Airtop account" } }
+    }
+  ],
+  "connections": {
+    "When clicking ‘Execute workflow’": { "main": [ [ { "node": "Set Targets", "type": "main", "index": 0 } ] ] },
+    "Schedule Trigger": { "main": [ [ { "node": "Set Targets", "type": "main", "index": 0 } ] ] },
+    "Set Targets": { "main": [ [ { "node": "Create Airtop Session", "type": "main", "index": 0 } ] ] },
+    "Create Airtop Session": { "main": [ [ { "node": "Expand to Platforms", "type": "main", "index": 0 } ] ] },
+    "Expand to Platforms": { "main": [ [ { "node": "Split In Batches", "type": "main", "index": 0 } ] ] },
+    "Split In Batches": { "main": [ [ { "node": "Build Target URL", "type": "main", "index": 0 } ] ] },
+    "Build Target URL": { "main": [ [ { "node": "Create Airtop Browser", "type": "main", "index": 0 } ] ] },
+    "Create Airtop Browser": { "main": [ [ { "node": "Extract and Analyze Posts", "type": "main", "index": 0 } ] ] },
+    "Extract and Analyze Posts": { "main": [ [ { "node": "Split Out", "type": "main", "index": 0 } ] ] },
+    "Split Out": { "main": [ [ { "node": "Filter", "type": "main", "index": 0 } ] ] },
+    "Filter": { "main": [ [ { "node": "Terminate Airtop Session", "type": "main", "index": 0 } ] ] }
+  }
+}
