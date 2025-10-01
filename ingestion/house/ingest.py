@@ -433,6 +433,20 @@ def main():
             continue
 
         norm = parse_pdf_for_trades(pdf_bytes, f.doc_id, f"{f.first} {f.last}".strip())
+        if since:
+            kept_rows = []
+            for row in norm:
+                date_txt = row.get("date", "")
+                try:
+                    row_date = dt.date.fromisoformat(date_txt)
+                except Exception:
+                    # If a row somehow lacks a parsable date, drop it when a
+                    # --since filter is provided. These rows are rare and the
+                    # caller explicitly requested a date range.
+                    continue
+                if row_date >= since:
+                    kept_rows.append(row)
+            norm = kept_rows
         if not norm:
             sys.stderr.write(f"[INFO] No trade-like rows found in {f.pdf_url}. Skipping.\n")
             continue
