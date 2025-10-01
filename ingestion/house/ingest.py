@@ -99,22 +99,63 @@ AMOUNT_BUCKETS = [
     (100000, 250000, 4),
     (250000, 10**12, 5),
 ]
-RANGE_RE = re.compile(r"\$?\s*([\d,]+)\s*[-–]\s*\$?\s*([\d,]+)")
+RANGE_RE = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)\s*[-–]\s*\$?\s*([\d,]+(?:\.\d+)?)")
 ASSET_RE = re.compile(r"^(?P<name>.+?)\s*\((?P<ticker>[A-Z.\-]{1,10})\)\s*(?:\[[A-Z]{2,3}\])?$")
 
-TRADE_ACTIONS = {"buy", "purchase", "sell", "sale", "exchange", "exercise", "assignment", "expiration"}
-EXCLUDE_TOKENS_RE = re.compile(
-    r"(salary|wages|freelance|consult|pension|retirement|social security|mortgage|loan|credit|liability|student loan|car loan|auto loan|revolving|patreon|youtube|tiktok|teaching|spouse salary|brand|marketing|bursar)",
-    re.I
-)
-AMOUNT_RANGE_RE = re.compile(r"\$\s*\d[\d,]*\s*[-–]\s*\$\s*\d[\d,]*")
+TRADE_ACTIONS = {
+    "buy",
+    "purchase",
+    "sell",
+    "sale",
+    "exchange",
+    "exercise",
+    "assignment",
+    "expiration",
+    "acquire",
+    "acquisition",
+    "dispose",
+    "disposition",
+}
+EXCLUDE_TOKENS = [
+    "salary",
+    "wages",
+    "freelance",
+    "consult",
+    "pension",
+    "retirement",
+    "social security",
+    "mortgage",
+    "loan",
+    "credit",
+    "liability",
+    "student loan",
+    "car loan",
+    "auto loan",
+    "revolving",
+    "patreon",
+    "youtube",
+    "tiktok",
+    "teaching",
+    "spouse salary",
+    "brand",
+    "marketing",
+    "bursar",
+]
+AMOUNT_RANGE_RE = re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?\s*[-–]\s*\$\s*\d[\d,]*(?:\.\d+)?")
 
 def is_amount_range(s: str) -> bool:
     return bool(AMOUNT_RANGE_RE.search((s or "").replace("\u00a0"," ").replace("\n"," ")))
 
 def has_excluded_token(row_values: List[str]) -> bool:
-    blob = " ".join([v or "" for v in row_values])
-    return bool(EXCLUDE_TOKENS_RE.search(blob))
+    blob = " ".join([v or "" for v in row_values]).lower()
+    for token in EXCLUDE_TOKENS:
+        if " " in token:
+            if token in blob:
+                return True
+        else:
+            if re.search(rf"\b{re.escape(token)}\b", blob):
+                return True
+    return False
 
 def parse_action(s: str) -> str:
     t = (s or "").strip().lower()
@@ -131,8 +172,16 @@ def parse_amount_bucket(amount_str: str) -> Tuple[int,int,int]:
     m = RANGE_RE.search(amount_str.replace("\u00a0"," ").replace("\n"," "))
     if not m:
         return (0,0,0)
-    lo = int(m.group(1).replace(",",""))
-    hi = int(m.group(2).replace(",",""))
+    lo_txt = m.group(1).replace(",","")
+    hi_txt = m.group(2).replace(",","")
+    try:
+        lo = int(float(lo_txt))
+    except ValueError:
+        lo = 0
+    try:
+        hi = int(float(hi_txt))
+    except ValueError:
+        hi = 0
     score = 0
     for lo_b, hi_b, s in AMOUNT_BUCKETS:
         if lo >= lo_b and hi <= hi_b:
@@ -249,7 +298,7 @@ def parse_pdf_for_trades(pdf_bytes: bytes, filing_id: str, actor: str) -> List[d
     if ptype == "FD":
         raw_rows = extract_transactions_region(pdf_bytes)  # only pages mentioning "Transactions"
         if not raw_rows:
-            return []
+            raw_rows = parse_tables_anyway(pdf_bytes)
     else:
         raw_rows = parse_tables_anyway(pdf_bytes)
 
