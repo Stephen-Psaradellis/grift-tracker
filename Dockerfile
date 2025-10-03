@@ -25,4 +25,4 @@ COPY . .
 ENV FLASK_APP=app.py \
     PORT=8000
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:create_app()"]
+CMD ["doppler run --project shortforge --config dev --  gunicorn", "--bind", "0.0.0.0:8000", "app:create_app()"]
