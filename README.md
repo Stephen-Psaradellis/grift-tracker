@@ -3,6 +3,29 @@ Introduction and Ethical Considerations
 
 Publicly available data about legislative activities, official statements, news coverage and even required financial disclosures from U.S. elected officials can be used to better understand market impacts. However, correlation does not mean causation; making investment decisions based on perceived motives of public officials can lead to losses and may involve ethical and legal risks. The plan below outlines how to automate the collection of public information and build dashboards in Supabase to track patterns. It does not guarantee financial return and should not be interpreted as financial advice.
 
+
+## Containerized ingestion service
+
+The repository now ships with a production-ready Docker image that exposes a Flask API for running the House disclosure ingestion pipeline and persisting the resulting transactions to Supabase. Build and run the container locally:
+
+```bash
+docker build -t grift-tracker .
+docker run --rm -p 8000:8000 \
+    -e SUPABASE_URL=... \
+    -e SUPABASE_SERVICE_ROLE_KEY=... \
+    grift-tracker
+```
+
+Trigger an ingestion by POSTing to `/ingest`. Parameters mirror the CLI flags and can be supplied as JSON or query parameters. For example, to import periodic transaction reports filed since 1 January 2025:
+
+```bash
+curl -X POST "http://localhost:8000/ingest?since=2025-01-01&filing_types=P" \
+     -H "Content-Type: application/json" \
+     -d '{"xml_url": "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/2025FD.zip"}'
+```
+
+The endpoint downloads disclosure bundles to a temporary directory, parses each PDF in-memory (so no disclosures persist on disk), and upserts the transactions into the `transaction_event` table using the Supabase credentials supplied through environment variables.
+
 Data Sources to Combine
 
 Congressional trading activity – Financial Modeling Prep’s Senate Trading Activity API monitors trades by U.S. senators, providing trade dates, assets, amounts and prices. It’s designed to improve transparency and helps identify potential conflicts of interest. FMP also offers related endpoints for House trades and financial disclosures.

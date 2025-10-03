@@ -398,19 +398,33 @@ def row_uid(source: str, filing_id: str, line_no: int, ticker: str,
 
 class PDFProcessor:
     """Handles PDF download and parsing"""
-    
+
     def __init__(self, cache_dir: Optional[Path] = None):
-        self.cache_dir = cache_dir or Path("pdf_cache")
-        self.cache_dir.mkdir(exist_ok=True)
+        """Create a processor for downloading and parsing PDFs.
+
+        Parameters
+        ----------
+        cache_dir:
+            Optional directory to persist downloaded PDFs. When ``None`` the
+            processor keeps downloads purely in-memory so that no disclosure
+            files are stored on disk – useful for ephemeral execution
+            environments.
+        """
+
+        if cache_dir:
+            cache_dir = Path(cache_dir)
+            cache_dir.mkdir(exist_ok=True)
+        self.cache_dir = cache_dir
         self._classification_cache = {}
     
     def download_pdf(self, url: str, doc_id: str, retry_count: int = 0) -> Optional[bytes]:
         """Download PDF with retry logic and caching"""
         # Check cache first
-        cache_file = self.cache_dir / f"{doc_id}.pdf"
-        if cache_file.exists():
-            logger.debug(f"Using cached PDF: {doc_id}")
-            return cache_file.read_bytes()
+        if self.cache_dir:
+            cache_file = self.cache_dir / f"{doc_id}.pdf"
+            if cache_file.exists():
+                logger.debug(f"Using cached PDF: {doc_id}")
+                return cache_file.read_bytes()
         
         try:
             import requests
@@ -427,9 +441,10 @@ class PDFProcessor:
             response.raise_for_status()
             pdf_bytes = response.content
             
-            # Cache the PDF
-            cache_file.write_bytes(pdf_bytes)
-            
+            # Cache the PDF if persistent storage is enabled
+            if self.cache_dir:
+                cache_file.write_bytes(pdf_bytes)
+
             return pdf_bytes
             
         except Exception as e:
@@ -984,7 +999,7 @@ Examples:
     # Processing options
     parser.add_argument('--download-and-parse', action='store_true', 
                        help='Download PDFs and extract trades (otherwise just parse XML metadata)')
-    parser.add_argument('--cache-dir', help='Directory for caching PDFs (default: pdf_cache)')
+    parser.add_argument('--cache-dir', help='Directory for caching PDFs (omit to keep downloads in-memory)')
     parser.add_argument('--max-workers', type=int, default=5, 
                        help='Maximum concurrent downloads (default: 5)')
     
