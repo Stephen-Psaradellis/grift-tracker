@@ -12,6 +12,11 @@ from flask import Flask, jsonify, request
 from supabase import Client, create_client
 
 from ingestion.house import ingest as house_ingest
+from ingestion.normalization import (
+    collect_company_records,
+    transaction_event_from_house_trade,
+)
+from ingestion.db import upsert_companies, upsert_transaction_events
 
 logger = logging.getLogger(__name__)
 DEFAULT_XML_BUNDLE_URL = "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/2025FD.zip"
@@ -184,21 +189,16 @@ def _run_ingestion(
 
 
 def _upsert_trades(client: Client, trades: Iterable[house_ingest.Trade]) -> int:
-    table_name = os.environ.get("SUPABASE_TRANSACTION_TABLE", "transaction_event")
-    payloads = [trade.to_dict() for trade in trades]
-    inserted = 0
+    events = [transaction_event_from_house_trade(trade) for trade in trades]
+    if not events:
+        return 0
 
-    for chunk in _chunk(payloads, size=100):
-        response = client.table(table_name).upsert(chunk, on_conflict="event_uid").execute()
-        data = getattr(response, "data", None)
-        inserted += len(data) if data is not None else len(chunk)
+    inserted = upsert_transaction_events(client, events)
+    company_rows = collect_company_records(events)
+    if company_rows:
+        upsert_companies(client, company_rows)
 
     return inserted
-
-
-def _chunk(values: Sequence[dict], size: int) -> Iterable[Sequence[dict]]:
-    for idx in range(0, len(values), size):
-        yield values[idx : idx + size]
 
 
 app = create_app()

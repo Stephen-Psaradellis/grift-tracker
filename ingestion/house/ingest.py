@@ -21,6 +21,21 @@ from typing import List, Optional, Tuple, Dict, Set
 import time
 from functools import lru_cache
 
+INGESTION_ROOT = Path(__file__).resolve().parents[1]
+if str(INGESTION_ROOT) not in sys.path:
+    sys.path.insert(0, str(INGESTION_ROOT))
+
+from parsing_utils import (  # noqa: E402
+    normalize_text,
+    parse_amount_range as _parse_amount_range,
+    parse_date as _parse_date,
+)
+from normalization import (  # noqa: E402
+    transaction_event_from_house_trade,
+)
+
+clean_text = normalize_text
+
 # Optional heavy deps are imported lazily inside functions:
 # pdfplumber, camelot, requests, pandas
 
@@ -168,35 +183,16 @@ class Trade:
             d['raw_data'] = str(self.raw_data)
         return d
 
+    def to_transaction_event(self, politician_id: Optional[str] = None):
+        """Normalize the trade into a ``transaction_event`` payload."""
+
+        return transaction_event_from_house_trade(self, politician_id=politician_id)
+
 # ============== Parsing Functions ==============
 
 def parse_date(s: str) -> Optional[dt.date]:
     """Parse date string with multiple format attempts"""
-    if not s:
-        return None
-    
-    s = s.strip()
-    for fmt in Config.DATE_FORMATS:
-        try:
-            return dt.datetime.strptime(s, fmt).date()
-        except ValueError:
-            continue
-    
-    # Try to extract date components with regex
-    date_pattern = r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})'
-    match = re.search(date_pattern, s)
-    if match:
-        m, d, y = match.groups()
-        y = int(y)
-        if y < 100:
-            y = 2000 + y if y < 50 else 1900 + y
-        try:
-            return dt.date(y, int(m), int(d))
-        except ValueError:
-            pass
-    
-    logger.debug(f"Unable to parse date: {s}")
-    return None
+    return _parse_date(s, formats=Config.DATE_FORMATS, logger=logger)
 
 def parse_financial_disclosure_xml(xml_path: str) -> List[Filing]:
     """Parse the Financial Disclosure XML file"""
@@ -240,10 +236,6 @@ def parse_financial_disclosure_xml(xml_path: str) -> List[Filing]:
 # ============== Enhanced Parsing Utilities ==============
 
 # Regex patterns
-AMOUNT_RANGE_RE = re.compile(
-    r"\$?\s*([\d,]+(?:\.\d+)?)\s*(?:[-–—]|to)\s*\$?\s*([\d,]+(?:\.\d+)?)",
-    re.IGNORECASE
-)
 ASSET_RE = re.compile(
     r"^(?P<name>.+?)\s*\((?P<ticker>[A-Z0-9.\-/]{1,10})\)\s*(?:\[(?P<type>[A-Z]{2,3})\])?$"
 )
@@ -253,44 +245,28 @@ OPTION_RE = re.compile(
     re.IGNORECASE
 )
 
-def clean_text(s: str) -> str:
-    """Clean and normalize text"""
-    if not s:
-        return ""
-    # Replace various Unicode spaces and dashes with ASCII equivalents
-    s = s.replace('\u00a0', ' ').replace('\u2013', '-').replace('\u2014', '-')
-    s = re.sub(r'\s+', ' ', s)
-    return s.strip()
-
 def is_amount_range(s: str) -> bool:
     """Check if string contains an amount range"""
-    s = clean_text(s)
-    return bool(AMOUNT_RANGE_RE.search(s))
+    lo, hi = _parse_amount_range(s)
+    return lo is not None and hi is not None and hi >= lo
 
 def parse_amount_bucket(amount_str: str) -> Tuple[int, int, int]:
     """Parse amount range and return (low, high, bucket_score)"""
-    if not amount_str:
+    lo, hi = _parse_amount_range(amount_str)
+    if lo is None and hi is None:
         return (0, 0, 0)
-    
-    amount_str = clean_text(amount_str)
-    match = AMOUNT_RANGE_RE.search(amount_str)
-    if not match:
-        return (0, 0, 0)
-    
-    try:
-        lo = int(float(match.group(1).replace(',', '')))
-        hi = int(float(match.group(2).replace(',', '')))
-    except (ValueError, AttributeError):
-        return (0, 0, 0)
-    
+
+    lo_val = lo or 0
+    hi_val = hi if hi is not None else lo_val
+
     # Find appropriate bucket
     bucket_score = 0
     for lo_b, hi_b, score in Config.AMOUNT_BUCKETS:
-        if lo >= lo_b and hi <= hi_b:
+        if lo_val >= lo_b and hi_val <= hi_b:
             bucket_score = score
             break
-    
-    return (lo, hi, bucket_score)
+
+    return (lo_val, hi_val, bucket_score)
 
 def parse_action(s: str) -> str:
     """Parse transaction action from string"""
@@ -871,6 +847,12 @@ def export_to_json(trades: List[Trade], output_path: str):
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     logger.info(f"Exported {len(trades)} trades to {output_path}")
+
+
+def trades_to_transaction_events(trades: List[Trade]) -> List[dict]:
+    """Convert trades into ``transaction_event`` payload dictionaries."""
+
+    return [trade.to_transaction_event().to_record() for trade in trades]
 
 def export_to_csv(trades: List[Trade], output_path: str):
     """Export trades to CSV file"""
