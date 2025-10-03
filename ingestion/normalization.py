@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, TYPE_CHECKING
 
-from .parsing_utils import normalize_text
+from parsing_utils import normalize_text
 
 __all__ = [
     "TransactionEvent",
