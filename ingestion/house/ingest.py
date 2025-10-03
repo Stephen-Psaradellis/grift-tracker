@@ -1,20 +1,118 @@
+#!/usr/bin/env python3
+"""
+Enhanced House Financial Disclosure Parser
+Parses stock/ETF/crypto/option trades from House of Representatives disclosure documents
+"""
 
 import argparse
 import datetime as dt
 import hashlib
 import io
 import json
+import logging
 import re
 import sys
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
+from enum import Enum
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict, Set
+import time
+from functools import lru_cache
 
 # Optional heavy deps are imported lazily inside functions:
-# pdfplumber, camelot, requests
+# pdfplumber, camelot, requests, pandas
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('disclosure_parser.log'),
+        logging.StreamHandler(sys.stderr)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ============== Configuration ==============
+
+class AssetType(Enum):
+    """Asset type classification"""
+    STOCK = "STOCK"
+    ETF = "ETF"
+    OPTION = "OPTION"
+    CRYPTO = "CRYPTO"
+    MUTUAL_FUND = "MUTUAL_FUND"
+    BOND = "BOND"
+    OTHER = "OTHER"
+
+class Config:
+    """Configuration constants"""
+    # Amount buckets for categorizing trade sizes
+    AMOUNT_BUCKETS = [
+        (0, 1000, 0),
+        (1000, 15000, 1),
+        (15000, 50000, 2),
+        (50000, 100000, 3),
+        (100000, 250000, 4),
+        (250000, 500000, 5),
+        (500000, 1000000, 6),
+        (1000000, 5000000, 7),
+        (5000000, 10**12, 8),
+    ]
+    
+    # Trade action keywords
+    TRADE_ACTIONS = {
+        "buy", "purchase", "acquire", "acquisition",
+        "sell", "sale", "dispose", "disposition",
+        "exchange", "exercise", "assignment", "expiration"
+    }
+    
+    # Tokens to exclude (non-trade items)
+    EXCLUDE_TOKENS = [
+        "salary", "wages", "honoraria", "freelance", "consult", "consulting",
+        "pension", "retirement", "social security", "ira", "401k", "403b",
+        "mortgage", "loan", "credit", "debt", "liability",
+        "student loan", "car loan", "auto loan", "personal loan",
+        "revolving", "line of credit", "heloc",
+        "patreon", "youtube", "tiktok", "instagram", "facebook",
+        "teaching", "speaking", "book", "royalty", "royalties",
+        "spouse salary", "dependent", "child",
+        "brand", "marketing", "sponsorship", "endorsement",
+        "bursar", "tuition", "education"
+    ]
+    
+    # Known cryptocurrency symbols
+    CRYPTO_SYMBOLS = {
+        'BTC', 'ETH', 'USDT', 'BNB', 'XRP', 'USDC', 'SOL', 'ADA', 'AVAX',
+        'DOGE', 'DOT', 'MATIC', 'SHIB', 'TRX', 'DAI', 'WBTC', 'LTC', 'BCH',
+        'LINK', 'UNI', 'XLM', 'ALGO', 'ATOM', 'FIL', 'HBAR', 'MANA', 'SAND'
+    }
+    
+    # Common ETF patterns
+    ETF_PATTERNS = ['ETF', 'FUND', 'INDEX', 'TRUST', 'SPDR', 'ISHARES', 'VANGUARD']
+    
+    # Option keywords
+    OPTION_KEYWORDS = ['call', 'put', 'option', 'strike', 'expiry', 'expire']
+    
+    # Date formats to try
+    DATE_FORMATS = [
+        "%m/%d/%Y", "%m/%d/%y", "%m-%d-%Y", "%Y-%m-%d",
+        "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d",
+        "%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y"
+    ]
+    
+    # PDF download settings
+    MAX_RETRIES = 3
+    TIMEOUT_SECONDS = 30
+    MAX_WORKERS = 5  # For concurrent downloads
+
+# ============== Data Classes ==============
 
 @dataclass
 class Filing:
+    """Represents a financial disclosure filing"""
     first: str
     last: str
     filing_type: str
@@ -22,441 +120,1004 @@ class Filing:
     year: int
     filing_date: dt.date
     doc_id: str
-
+    
+    @property
+    def full_name(self) -> str:
+        return f"{self.first} {self.last}".strip()
+    
     @property
     def pdf_url(self) -> str:
-        # Most PTRs appear as W/C/D; others (e.g., P) are FD
+        """Generate PDF URL based on filing type"""
         ptr_types = {"W", "C", "D"}
         folder = "ptr-pdfs" if self.filing_type.upper() in ptr_types else "financial-pdfs"
         return f"https://disclosures-clerk.house.gov/public_disc/{folder}/{self.year}/{self.doc_id}.pdf"
+    
+    @property
+    def alternate_pdf_url(self) -> str:
+        """Generate alternate PDF URL (fallback)"""
+        ptr_types = {"W", "C", "D"}
+        folder = "financial-pdfs" if self.filing_type.upper() in ptr_types else "ptr-pdfs"
+        return f"https://disclosures-clerk.house.gov/public_disc/{folder}/{self.year}/{self.doc_id}.pdf"
 
-def parse_date(s: str) -> dt.date:
-    # Clerk uses M/D/YYYY or MM/DD/YYYY
-    m, d, y = [int(x) for x in s.split("/")]
-    return dt.date(y, m, d)
+@dataclass
+class Trade:
+    """Represents a parsed trade transaction"""
+    event_uid: str
+    filing_id: str
+    actor: str
+    date: dt.date
+    action: str
+    owner: str
+    ticker: str
+    company: str
+    asset_type: AssetType
+    amount_range: str
+    amount_lo: int
+    amount_hi: int
+    amount_bucket: int
+    cap_gains_over_200: bool = False
+    description: str = ""
+    raw_data: dict = None
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for JSON serialization"""
+        d = asdict(self)
+        d['date'] = self.date.isoformat()
+        d['asset_type'] = self.asset_type.value
+        if self.raw_data and not isinstance(self.raw_data, dict):
+            d['raw_data'] = str(self.raw_data)
+        return d
+
+# ============== Parsing Functions ==============
+
+def parse_date(s: str) -> Optional[dt.date]:
+    """Parse date string with multiple format attempts"""
+    if not s:
+        return None
+    
+    s = s.strip()
+    for fmt in Config.DATE_FORMATS:
+        try:
+            return dt.datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    
+    # Try to extract date components with regex
+    date_pattern = r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})'
+    match = re.search(date_pattern, s)
+    if match:
+        m, d, y = match.groups()
+        y = int(y)
+        if y < 100:
+            y = 2000 + y if y < 50 else 1900 + y
+        try:
+            return dt.date(y, int(m), int(d))
+        except ValueError:
+            pass
+    
+    logger.debug(f"Unable to parse date: {s}")
+    return None
 
 def parse_financial_disclosure_xml(xml_path: str) -> List[Filing]:
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    out: List[Filing] = []
-    for m in root.findall(".//Member"):
-        first = (m.findtext("First") or "").strip()
-        last = (m.findtext("Last") or "").strip()
-        ftype = (m.findtext("FilingType") or "").strip()
-        state_dst = (m.findtext("StateDst") or "").strip()
-        year_txt = (m.findtext("Year") or "").strip()
-        fdate_txt = (m.findtext("FilingDate") or "").strip()
-        docid = (m.findtext("DocID") or "").strip()
-
-        if not docid or not year_txt or not fdate_txt:
-            continue
+    """Parse the Financial Disclosure XML file"""
+    logger.info(f"Parsing XML file: {xml_path}")
+    
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except ET.ParseError as e:
+        logger.error(f"Failed to parse XML: {e}")
+        return []
+    
+    filings = []
+    for member in root.findall(".//Member"):
         try:
+            first = (member.findtext("First") or "").strip()
+            last = (member.findtext("Last") or "").strip()
+            filing_type = (member.findtext("FilingType") or "").strip()
+            state_dst = (member.findtext("StateDst") or "").strip()
+            year_txt = (member.findtext("Year") or "").strip()
+            filing_date_txt = (member.findtext("FilingDate") or "").strip()
+            doc_id = (member.findtext("DocID") or "").strip()
+            
+            if not all([doc_id, year_txt, filing_date_txt]):
+                continue
+            
             year = int(year_txt)
-            fdate = parse_date(fdate_txt)
-        except Exception:
+            filing_date = parse_date(filing_date_txt)
+            if not filing_date:
+                continue
+            
+            filings.append(Filing(first, last, filing_type, state_dst, year, filing_date, doc_id))
+            
+        except (ValueError, AttributeError) as e:
+            logger.debug(f"Skipping malformed member entry: {e}")
             continue
-        out.append(Filing(first, last, ftype, state_dst, year, fdate, docid))
-    return out
+    
+    logger.info(f"Parsed {len(filings)} filings from XML")
+    return filings
 
-def name_matches(f: Filing, names: List[Tuple[str,str]]) -> bool:
-    if not names:
-        return True
-    last_first = (f.last.lower(), f.first.lower())
-    for (ln, fn) in names:
-        if (ln.lower(), fn.lower()) == last_first:
-            return True
+# ============== Enhanced Parsing Utilities ==============
+
+# Regex patterns
+AMOUNT_RANGE_RE = re.compile(
+    r"\$?\s*([\d,]+(?:\.\d+)?)\s*(?:[-–—]|to)\s*\$?\s*([\d,]+(?:\.\d+)?)",
+    re.IGNORECASE
+)
+ASSET_RE = re.compile(
+    r"^(?P<name>.+?)\s*\((?P<ticker>[A-Z0-9.\-/]{1,10})\)\s*(?:\[(?P<type>[A-Z]{2,3})\])?$"
+)
+OPTION_RE = re.compile(
+    r"(?P<underlying>.+?)\s+(?P<type>call|put)s?\s+(?:option)?\s*"
+    r"(?:\$(?P<strike>[\d.]+))?\s*(?:exp|expire)?\s*(?P<expiry>[\d/\-]+)?",
+    re.IGNORECASE
+)
+
+def clean_text(s: str) -> str:
+    """Clean and normalize text"""
+    if not s:
+        return ""
+    # Replace various Unicode spaces and dashes with ASCII equivalents
+    s = s.replace('\u00a0', ' ').replace('\u2013', '-').replace('\u2014', '-')
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip()
+
+def is_amount_range(s: str) -> bool:
+    """Check if string contains an amount range"""
+    s = clean_text(s)
+    return bool(AMOUNT_RANGE_RE.search(s))
+
+def parse_amount_bucket(amount_str: str) -> Tuple[int, int, int]:
+    """Parse amount range and return (low, high, bucket_score)"""
+    if not amount_str:
+        return (0, 0, 0)
+    
+    amount_str = clean_text(amount_str)
+    match = AMOUNT_RANGE_RE.search(amount_str)
+    if not match:
+        return (0, 0, 0)
+    
+    try:
+        lo = int(float(match.group(1).replace(',', '')))
+        hi = int(float(match.group(2).replace(',', '')))
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+    
+    # Find appropriate bucket
+    bucket_score = 0
+    for lo_b, hi_b, score in Config.AMOUNT_BUCKETS:
+        if lo >= lo_b and hi <= hi_b:
+            bucket_score = score
+            break
+    
+    return (lo, hi, bucket_score)
+
+def parse_action(s: str) -> str:
+    """Parse transaction action from string"""
+    if not s:
+        return ""
+    
+    s = clean_text(s).lower()
+    
+    # Handle single letter codes
+    if s in ['p', 'b']:
+        return "Buy"
+    elif s in ['s', 's (partial)']:
+        return "Sell"
+    elif s == 'e':
+        return "Exchange"
+    
+    # Check for action keywords
+    for action in Config.TRADE_ACTIONS:
+        if re.search(rf'\b{action}\b', s):
+            return action.capitalize()
+    
+    return ""
+
+@lru_cache(maxsize=1000)
+def classify_asset_type(asset_str: str, ticker: str) -> AssetType:
+    """Classify asset as STOCK, ETF, OPTION, CRYPTO, etc."""
+    asset_lower = asset_str.lower() if asset_str else ""
+    ticker_upper = ticker.upper() if ticker else ""
+    
+    # Check for options
+    if any(kw in asset_lower for kw in Config.OPTION_KEYWORDS):
+        return AssetType.OPTION
+    if OPTION_RE.search(asset_str):
+        return AssetType.OPTION
+    
+    # Check for crypto
+    if ticker_upper in Config.CRYPTO_SYMBOLS:
+        return AssetType.CRYPTO
+    if any(kw in asset_lower for kw in ['crypto', 'bitcoin', 'ethereum', 'digital asset']):
+        return AssetType.CRYPTO
+    
+    # Check for mutual funds
+    if any(kw in asset_lower for kw in ['mutual fund', 'index fund']):
+        return AssetType.MUTUAL_FUND
+    
+    # Check for bonds
+    if any(kw in asset_lower for kw in ['bond', 'treasury', 'note', 'bill']):
+        return AssetType.BOND
+    
+    # Check for ETFs
+    if any(pattern.lower() in asset_lower for pattern in Config.ETF_PATTERNS):
+        return AssetType.ETF
+    if ticker_upper.endswith('F') and len(ticker_upper) == 4:  # Common ETF pattern
+        return AssetType.ETF
+    
+    # Default to stock if has ticker, otherwise OTHER
+    return AssetType.STOCK if ticker else AssetType.OTHER
+
+def parse_asset(field: str) -> Tuple[str, str, Optional[dict]]:
+    """Parse asset field to extract company, ticker, and option details"""
+    if not field:
+        return ("", "", None)
+    
+    field = clean_text(field)
+    
+    # Check for option pattern first
+    option_match = OPTION_RE.search(field)
+    if option_match:
+        option_data = option_match.groupdict()
+        underlying = option_data.get('underlying', '').strip()
+        # Try to extract ticker from underlying
+        asset_match = ASSET_RE.search(underlying)
+        if asset_match:
+            return (asset_match.group('name'), asset_match.group('ticker'), option_data)
+        return (underlying, "", option_data)
+    
+    # Standard asset pattern
+    asset_match = ASSET_RE.search(field)
+    if asset_match:
+        return (asset_match.group('name').strip(), asset_match.group('ticker').strip(), None)
+    
+    return (field, "", None)
+
+def has_excluded_token(row_values: List[str]) -> bool:
+    """Check if row contains excluded tokens (non-trade items)"""
+    text = " ".join([v or "" for v in row_values]).lower()
+    
+    for token in Config.EXCLUDE_TOKENS:
+        if " " in token:
+            if token in text:
+                return True
+        else:
+            if re.search(rf'\b{re.escape(token)}\b', text):
+                return True
+    
     return False
 
-def filingtype_matches(f: Filing, types: List[str]) -> bool:
-    if not types:
-        return True
-    return f.filing_type.upper() in {t.upper() for t in types}
+def row_uid(source: str, filing_id: str, line_no: int, ticker: str, 
+           date_iso: str, amount_str: str, action: str) -> str:
+    """Generate unique ID for a row"""
+    key = f"{source}|{filing_id}|{line_no}|{ticker}|{date_iso}|{amount_str}|{action}".encode()
+    return hashlib.sha256(key).hexdigest()[:16]  # Shorter hash for readability
+
+# ============== PDF Processing ==============
+
+class PDFProcessor:
+    """Handles PDF download and parsing"""
+    
+    def __init__(self, cache_dir: Optional[Path] = None):
+        self.cache_dir = cache_dir or Path("pdf_cache")
+        self.cache_dir.mkdir(exist_ok=True)
+        self._classification_cache = {}
+    
+    def download_pdf(self, url: str, doc_id: str, retry_count: int = 0) -> Optional[bytes]:
+        """Download PDF with retry logic and caching"""
+        # Check cache first
+        cache_file = self.cache_dir / f"{doc_id}.pdf"
+        if cache_file.exists():
+            logger.debug(f"Using cached PDF: {doc_id}")
+            return cache_file.read_bytes()
+        
+        try:
+            import requests
+            
+            logger.info(f"Downloading PDF: {url}")
+            response = requests.get(url, timeout=Config.TIMEOUT_SECONDS)
+            
+            if response.status_code == 404 and retry_count == 0:
+                # Try alternate URL
+                alt_url = url.replace("ptr-pdfs", "financial-pdfs") if "ptr-pdfs" in url else url.replace("financial-pdfs", "ptr-pdfs")
+                logger.info(f"Trying alternate URL: {alt_url}")
+                return self.download_pdf(alt_url, doc_id, retry_count + 1)
+            
+            response.raise_for_status()
+            pdf_bytes = response.content
+            
+            # Cache the PDF
+            cache_file.write_bytes(pdf_bytes)
+            
+            return pdf_bytes
+            
+        except Exception as e:
+            if retry_count < Config.MAX_RETRIES:
+                logger.warning(f"Download failed, retrying... ({e})")
+                time.sleep(2 ** retry_count)  # Exponential backoff
+                return self.download_pdf(url, doc_id, retry_count + 1)
+            
+            logger.error(f"Failed to download PDF after {Config.MAX_RETRIES} attempts: {e}")
+            return None
+    
+    def classify_pdf(self, pdf_bytes: bytes, doc_id: str) -> str:
+        """Classify PDF as PTR, FD, or UNKNOWN"""
+        if doc_id in self._classification_cache:
+            return self._classification_cache[doc_id]
+        
+        try:
+            import pdfplumber
+            
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                if not pdf.pages:
+                    return "UNKNOWN"
+                
+                first_text = (pdf.pages[0].extract_text() or "").lower()
+                
+                if "periodic transaction report" in first_text:
+                    classification = "PTR"
+                elif "financial disclosure" in first_text:
+                    classification = "FD"
+                else:
+                    classification = "UNKNOWN"
+                
+                self._classification_cache[doc_id] = classification
+                return classification
+                
+        except Exception as e:
+            logger.debug(f"PDF classification failed: {e}")
+            return "UNKNOWN"
+    
+    def extract_tables_pdfplumber(self, pdf_bytes: bytes) -> List[dict]:
+        """Extract tables using pdfplumber"""
+        rows = []
+        try:
+            import pdfplumber
+            
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page_num, page in enumerate(pdf.pages, 1):
+                    try:
+                        tables = page.extract_tables() or []
+                        for table in tables:
+                            if not table or len(table) < 2:
+                                continue
+                            
+                            # Extract headers
+                            headers = [
+                                (str(table[0][i] or f"col{i}")).strip().lower().replace('\n', ' ')
+                                for i in range(len(table[0]))
+                            ]
+                            
+                            # Extract rows
+                            for row_data in table[1:]:
+                                if len(row_data) != len(headers):
+                                    continue
+                                row = {
+                                    headers[i]: clean_text(str(row_data[i] or ""))
+                                    for i in range(len(headers))
+                                }
+                                rows.append(row)
+                                
+                    except Exception as e:
+                        logger.debug(f"Error processing page {page_num}: {e}")
+                        continue
+                        
+        except Exception as e:
+            logger.debug(f"pdfplumber extraction failed: {e}")
+        
+        return rows
+    
+    def extract_tables_camelot(self, pdf_bytes: bytes) -> List[dict]:
+        """Extract tables using camelot"""
+        rows = []
+        try:
+            import camelot
+            import tempfile
+            
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
+                tmp.write(pdf_bytes)
+                tmp.flush()
+                
+                # Try lattice mode first, then stream
+                for flavor in ['lattice', 'stream']:
+                    try:
+                        tables = camelot.read_pdf(tmp.name, pages="all", flavor=flavor)
+                        
+                        for table in tables:
+                            df = table.df
+                            if df.empty or len(df) < 2:
+                                continue
+                            
+                            headers = [str(h).strip().lower() for h in df.iloc[0].tolist()]
+                            
+                            for i in range(1, len(df)):
+                                vals = df.iloc[i].tolist()
+                                row = {
+                                    headers[j]: clean_text(str(vals[j]))
+                                    for j in range(min(len(headers), len(vals)))
+                                }
+                                rows.append(row)
+                        
+                        if rows:  # If we got results, don't try the other flavor
+                            break
+                            
+                    except Exception as e:
+                        logger.debug(f"Camelot {flavor} mode failed: {e}")
+                        continue
+                        
+        except ImportError:
+            logger.debug("Camelot not installed, skipping")
+        except Exception as e:
+            logger.debug(f"Camelot extraction failed: {e}")
+        
+        return rows
+    
+    def extract_transactions_region(self, pdf_bytes: bytes) -> List[dict]:
+        """Extract only transaction tables from FD documents"""
+        rows = []
+        try:
+            import pdfplumber
+            
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages:
+                    text = (page.extract_text() or "").lower()
+                    
+                    # Only process pages mentioning transactions
+                    if "transaction" not in text:
+                        continue
+                    
+                    tables = page.extract_tables() or []
+                    for table in tables:
+                        if not table or len(table) < 2:
+                            continue
+                        
+                        headers = [
+                            (str(table[0][i] or f"col{i}")).strip().lower().replace('\n', ' ')
+                            for i in range(len(table[0]))
+                        ]
+                        
+                        for row_data in table[1:]:
+                            if len(row_data) != len(headers):
+                                continue
+                            row = {
+                                headers[i]: clean_text(str(row_data[i] or ""))
+                                for i in range(len(headers))
+                            }
+                            rows.append(row)
+                            
+        except Exception as e:
+            logger.debug(f"Transaction region extraction failed: {e}")
+        
+        return rows
+    
+    def parse_pdf_for_trades(self, pdf_bytes: bytes, filing_id: str, actor: str) -> List[Trade]:
+        """Parse PDF to extract trade transactions"""
+        pdf_type = self.classify_pdf(pdf_bytes, filing_id)
+        
+        # Get raw rows based on PDF type
+        if pdf_type == "FD":
+            raw_rows = self.extract_transactions_region(pdf_bytes)
+            if not raw_rows:
+                raw_rows = self.extract_tables_pdfplumber(pdf_bytes)
+                if not raw_rows:
+                    raw_rows = self.extract_tables_camelot(pdf_bytes)
+        else:
+            raw_rows = self.extract_tables_pdfplumber(pdf_bytes)
+            if not raw_rows:
+                raw_rows = self.extract_tables_camelot(pdf_bytes)
+        
+        trades = []
+        for idx, row in enumerate(raw_rows):
+            trade = self._parse_trade_row(row, filing_id, actor, idx)
+            if trade:
+                trades.append(trade)
+        
+        return trades
+    
+    def _parse_trade_row(self, row: dict, filing_id: str, actor: str, line_no: int) -> Optional[Trade]:
+        """Parse a single row into a Trade object"""
+        # Normalize keys
+        normalized = {k.lower().strip(): v for k, v in row.items()}
+        
+        # Check for excluded tokens
+        if has_excluded_token(list(normalized.values())):
+            return None
+        
+        # Extract date
+        date_str = (
+            normalized.get("date") or 
+            normalized.get("transaction date") or 
+            normalized.get("tx date") or 
+            normalized.get("trade date") or 
+            normalized.get("transaction dt") or 
+            ""
+        )
+        
+        trade_date = parse_date(date_str)
+        if not trade_date:
+            return None
+        
+        # Extract action
+        action_raw = normalized.get("transaction type") or normalized.get("type") or ""
+        action = parse_action(action_raw)
+        if not action:
+            return None
+        
+        # Extract amount
+        amount = (
+            normalized.get("amount") or 
+            normalized.get("amount range") or 
+            normalized.get("value") or 
+            normalized.get("value of asset") or 
+            ""
+        )
+        
+        if not is_amount_range(amount):
+            return None
+        
+        lo, hi, bucket = parse_amount_bucket(amount)
+        
+        # Extract asset information
+        asset_field = (
+            normalized.get("asset") or 
+            normalized.get("security") or 
+            normalized.get("company") or 
+            normalized.get("description") or 
+            ""
+        )
+        
+        company, ticker, option_data = parse_asset(asset_field)
+        
+        if not (ticker or company):
+            return None
+        
+        # Extract owner
+        owner = normalized.get("owner") or ""
+        
+        # Check for capital gains
+        cap_gains = normalized.get("capital gains over $200") or ""
+        cap_gains_over_200 = cap_gains.lower() in ['yes', 'y', 'true', '1']
+        
+        # Classify asset type
+        asset_type = classify_asset_type(asset_field, ticker)
+        
+        # Generate unique ID
+        uid = row_uid("house_ptr", filing_id, line_no, ticker or company, 
+                     trade_date.isoformat(), amount, action)
+        
+        # Add description for options
+        description = ""
+        if option_data:
+            description = f"{option_data.get('type', '').upper()} Option"
+            if option_data.get('strike'):
+                description += f" Strike: ${option_data['strike']}"
+            if option_data.get('expiry'):
+                description += f" Exp: {option_data['expiry']}"
+        
+        return Trade(
+            event_uid=uid,
+            filing_id=filing_id,
+            actor=actor,
+            date=trade_date,
+            action=action,
+            owner=owner,
+            ticker=ticker,
+            company=company,
+            asset_type=asset_type,
+            amount_range=amount,
+            amount_lo=lo,
+            amount_hi=hi,
+            amount_bucket=bucket,
+            cap_gains_over_200=cap_gains_over_200,
+            description=description,
+            raw_data=row
+        )
+
+# ============== Filtering Functions ==============
 
 def filter_filings(
     filings: List[Filing],
-    since: Optional[dt.date],
-    names: List[Tuple[str,str]],
-    filing_types: List[str]
+    since: Optional[dt.date] = None,
+    until: Optional[dt.date] = None,
+    names: Optional[List[Tuple[str, str]]] = None,
+    filing_types: Optional[List[str]] = None,
+    states: Optional[List[str]] = None
 ) -> List[Filing]:
-    out = []
-    for f in filings:
-        if since and f.filing_date < since:
+    """Filter filings based on criteria"""
+    filtered = []
+    
+    for filing in filings:
+        # Date filtering
+        if since and filing.filing_date < since:
             continue
-        if not name_matches(f, names):
+        if until and filing.filing_date > until:
             continue
-        if not filingtype_matches(f, filing_types):
+        
+        # Name filtering
+        if names:
+            name_match = False
+            for last, first in names:
+                if (filing.last.lower() == last.lower() and 
+                    filing.first.lower() == first.lower()):
+                    name_match = True
+                    break
+            if not name_match:
+                continue
+        
+        # Filing type filtering
+        if filing_types and filing.filing_type.upper() not in {t.upper() for t in filing_types}:
             continue
-        out.append(f)
-    return out
+        
+        # State filtering
+        if states and filing.state_dst not in states:
+            continue
+        
+        filtered.append(filing)
+    
+    return filtered
 
-# ---------- Heuristics & utilities ----------
+def validate_trade(trade: Trade) -> bool:
+    """Validate trade data for quality"""
+    # Check date is reasonable
+    if trade.date > dt.date.today():
+        logger.debug(f"Trade date in future: {trade.date}")
+        return False
+    
+    if trade.date < dt.date(1990, 1, 1):
+        logger.debug(f"Trade date too old: {trade.date}")
+        return False
+    
+    # Check amounts are sensible
+    if trade.amount_lo > trade.amount_hi:
+        logger.debug(f"Invalid amount range: {trade.amount_lo} > {trade.amount_hi}")
+        return False
+    
+    # Must have either ticker or company
+    if not (trade.ticker or trade.company):
+        logger.debug("Trade missing ticker and company")
+        return False
+    
+    return True
 
-AMOUNT_BUCKETS = [
-    (0, 1000, 0),
-    (1000, 15000, 1),
-    (15000, 50000, 2),
-    (50000, 100000, 3),
-    (100000, 250000, 4),
-    (250000, 10**12, 5),
-]
-RANGE_RE = re.compile(r"\$?\s*([\d,]+(?:\.\d+)?)\s*[-–]\s*\$?\s*([\d,]+(?:\.\d+)?)")
-ASSET_RE = re.compile(r"^(?P<name>.+?)\s*\((?P<ticker>[A-Z.\-]{1,10})\)\s*(?:\[[A-Z]{2,3}\])?$")
+# ============== Main Processing ==============
 
-TRADE_ACTIONS = {
-    "buy",
-    "purchase",
-    "sell",
-    "sale",
-    "exchange",
-    "exercise",
-    "assignment",
-    "expiration",
-    "acquire",
-    "acquisition",
-    "dispose",
-    "disposition",
-}
-EXCLUDE_TOKENS = [
-    "salary",
-    "wages",
-    "freelance",
-    "consult",
-    "pension",
-    "retirement",
-    "social security",
-    "mortgage",
-    "loan",
-    "credit",
-    "liability",
-    "student loan",
-    "car loan",
-    "auto loan",
-    "revolving",
-    "patreon",
-    "youtube",
-    "tiktok",
-    "teaching",
-    "spouse salary",
-    "brand",
-    "marketing",
-    "bursar",
-]
-AMOUNT_RANGE_RE = re.compile(r"\$\s*\d[\d,]*(?:\.\d+)?\s*[-–]\s*\$\s*\d[\d,]*(?:\.\d+)?")
-
-def is_amount_range(s: str) -> bool:
-    return bool(AMOUNT_RANGE_RE.search((s or "").replace("\u00a0"," ").replace("\n"," ")))
-
-def has_excluded_token(row_values: List[str]) -> bool:
-    blob = " ".join([v or "" for v in row_values]).lower()
-    for token in EXCLUDE_TOKENS:
-        if " " in token:
-            if token in blob:
-                return True
-        else:
-            if re.search(rf"\b{re.escape(token)}\b", blob):
-                return True
-    return False
-
-def parse_action(s: str) -> str:
-    t = (s or "").strip().lower()
-    # normalize variants
-    t = t.replace("p", "buy").replace("s", "sell").replace("s (partial)", "sell")
-    for a in TRADE_ACTIONS:
-        if a in t:
-            return a.capitalize()
-    return ""
-
-def parse_amount_bucket(amount_str: str) -> Tuple[int,int,int]:
-    if not amount_str:
-        return (0,0,0)
-    m = RANGE_RE.search(amount_str.replace("\u00a0"," ").replace("\n"," "))
-    if not m:
-        return (0,0,0)
-    lo_txt = m.group(1).replace(",","")
-    hi_txt = m.group(2).replace(",","")
-    try:
-        lo = int(float(lo_txt))
-    except ValueError:
-        lo = 0
-    try:
-        hi = int(float(hi_txt))
-    except ValueError:
-        hi = 0
-    score = 0
-    for lo_b, hi_b, s in AMOUNT_BUCKETS:
-        if lo >= lo_b and hi <= hi_b:
-            score = s
-            break
-    return (lo, hi, score)
-
-def row_uid(source: str, filing_id: str, line_no: int, ticker: str, date_iso: str, amount_str: str, action: str) -> str:
-    key = f"{source}|{filing_id}|{line_no}|{ticker}|{date_iso}|{amount_str}|{action}".encode()
-    return hashlib.sha256(key).hexdigest()
-
-def clean_key(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
-
-def looks_like_trade(row: dict) -> bool:
-    k = {clean_key(k): v for k,v in row.items()}
-    values_concat = " ".join((v or "") for v in k.values())
-    has_amount = bool(re.search(r"\$\s*\d", values_concat))
-    has_date = any(key in k for key in ["date","transaction date","tx date","trade date","transaction dt"])
-    has_action = any(key in k for key in ["transaction type","type"])
-    # require amount + (date or action)
-    return has_amount and (has_date or has_action)
-
-def parse_asset(field: str) -> Tuple[str,str]:
-    if not field:
-        return ("","")
-    s = field.replace("\n"," ").strip()
-    m = ASSET_RE.search(s)
-    if m:
-        return (m.group("name").strip(), m.group("ticker").strip())
-    return (s, "")
-
-# ---------- PDF parsing ----------
-
-def classify_pdf(pdf_bytes: bytes) -> str:
-    # returns "PTR" | "FD" | "UNKNOWN"
-    try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            first_text = (pdf.pages[0].extract_text() or "").lower()
-            if "periodic transaction report" in first_text:
-                return "PTR"
-            if "financial disclosure" in first_text:
-                return "FD"
-    except Exception:
-        pass
-    return "UNKNOWN"
-
-def _rows_from_table(tbl):
-    headers = [ (tbl[0][i] or f"col{i}").strip().lower().replace("\n"," ").replace("  "," ")
-               for i in range(len(tbl[0])) ]
-    out = []
-    for r in tbl[1:]:
-        row = { headers[i]: (r[i] or "").strip() for i in range(len(headers)) }
-        out.append(row)
-    return out
-
-def extract_transactions_region(pdf_bytes: bytes) -> List[dict]:
-    # For FD files: only keep tables on pages that mention "Transactions"
-    rows: List[dict] = []
-    try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for page in pdf.pages:
-                text = (page.extract_text() or "").lower()
-                if "transactions" not in text:
-                    continue
-                tables = page.extract_tables() or []
-                for tbl in tables:
-                    if tbl and len(tbl) > 1:
-                        rows.extend(_rows_from_table(tbl))
-    except Exception:
-        pass
-    return rows
-
-def parse_tables_anyway(pdf_bytes: bytes) -> List[dict]:
-    # PTR or unknown: try camelot then pdfplumber
-    rows: List[dict] = []
-    try:
-        import camelot, tempfile
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
-            tmp.write(pdf_bytes); tmp.flush()
+def process_filing_batch(
+    filings: List[Filing], 
+    processor: PDFProcessor,
+    download_and_parse: bool = False,
+    since_date: Optional[dt.date] = None
+) -> List[Trade]:
+    """Process a batch of filings"""
+    all_trades = []
+    
+    if not download_and_parse:
+        return all_trades
+    
+    with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+        future_to_filing = {}
+        
+        for filing in filings:
+            future = executor.submit(
+                process_single_filing,
+                filing,
+                processor,
+                since_date
+            )
+            future_to_filing[future] = filing
+        
+        for future in as_completed(future_to_filing):
+            filing = future_to_filing[future]
             try:
-                tables = camelot.read_pdf(tmp.name, pages="all", flavor="lattice")
-                if tables and len(tables) == 0:
-                    tables = camelot.read_pdf(tmp.name, pages="all", flavor="stream")
-            except Exception:
-                tables = []
-            for t in tables or []:
-                df = t.df
-                headers = [h.strip().lower() for h in df.iloc[0].tolist()]
-                for i in range(1, len(df)):
-                    vals = df.iloc[i].tolist()
-                    row = {headers[j] if j < len(headers) else f"col{j}": str(vals[j]).strip() for j in range(len(vals))}
-                    rows.append(row)
-    except Exception:
-        pass
-    if not rows:
-        try:
-            import pdfplumber
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                for p in pdf.pages:
-                    ts = p.extract_tables() or []
-                    for tbl in ts:
-                        if not tbl or len(tbl) < 2:
-                            continue
-                        rows.extend(_rows_from_table(tbl))
-        except Exception:
-            pass
-    return rows
+                trades = future.result()
+                all_trades.extend(trades)
+                if trades:
+                    logger.info(f"Extracted {len(trades)} trades from {filing.doc_id}")
+            except Exception as e:
+                logger.error(f"Failed to process filing {filing.doc_id}: {e}")
+    
+    return all_trades
 
-def parse_pdf_for_trades(pdf_bytes: bytes, filing_id: str, actor: str) -> List[dict]:
-    ptype = classify_pdf(pdf_bytes)
-    if ptype == "FD":
-        raw_rows = extract_transactions_region(pdf_bytes)  # only pages mentioning "Transactions"
-        if not raw_rows:
-            raw_rows = parse_tables_anyway(pdf_bytes)
-    else:
-        raw_rows = parse_tables_anyway(pdf_bytes)
+def process_single_filing(
+    filing: Filing,
+    processor: PDFProcessor,
+    since_date: Optional[dt.date] = None
+) -> List[Trade]:
+    """Process a single filing"""
+    # Download PDF
+    pdf_bytes = processor.download_pdf(filing.pdf_url, filing.doc_id)
+    if not pdf_bytes:
+        # Try alternate URL
+        pdf_bytes = processor.download_pdf(filing.alternate_pdf_url, filing.doc_id)
+        if not pdf_bytes:
+            logger.warning(f"Could not download PDF for {filing.doc_id}")
+            return []
+    
+    # Parse trades from PDF
+    trades = processor.parse_pdf_for_trades(pdf_bytes, filing.doc_id, filing.full_name)
+    
+    # Filter by date if specified
+    if since_date:
+        trades = [t for t in trades if t.date >= since_date]
+    
+    # Validate trades
+    valid_trades = [t for t in trades if validate_trade(t)]
+    
+    if len(valid_trades) < len(trades):
+        logger.debug(f"Filtered out {len(trades) - len(valid_trades)} invalid trades")
+    
+    return valid_trades
 
-    kept = []
-    for r in raw_rows:
-        rr = { clean_key(k): (v or "").strip() for k,v in r.items() }
-        # exclude obvious income/liability/etc. rows
-        if has_excluded_token(list(rr.values())):
-            continue
+# ============== Export Functions ==============
 
-        # pick likely columns
-        date = rr.get("date") or rr.get("transaction date") or rr.get("tx date") or rr.get("trade date") or rr.get("transaction dt") or ""
-        action_raw = rr.get("transaction type") or rr.get("type") or ""
-        action = parse_action(action_raw)
-        owner = rr.get("owner") or ""
-        amount = rr.get("amount") or rr.get("amount range") or rr.get("value") or rr.get("value of asset") or ""
-        asset = rr.get("asset") or rr.get("security") or rr.get("company") or rr.get("description") or ""
+def export_to_json(trades: List[Trade], output_path: str):
+    """Export trades to JSON file"""
+    data = [trade.to_dict() for trade in trades]
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    logger.info(f"Exported {len(trades)} trades to {output_path}")
 
-        # inclusion gates
-        if not action:
-            continue
-        if not is_amount_range(amount):
-            continue
+def export_to_csv(trades: List[Trade], output_path: str):
+    """Export trades to CSV file"""
+    try:
+        import pandas as pd
+        
+        data = [trade.to_dict() for trade in trades]
+        df = pd.DataFrame(data)
+        
+        # Reorder columns for better readability
+        column_order = [
+            'date', 'actor', 'action', 'ticker', 'company', 'asset_type',
+            'amount_lo', 'amount_hi', 'amount_range', 'owner', 
+            'cap_gains_over_200', 'filing_id', 'event_uid'
+        ]
+        
+        # Only include columns that exist
+        columns = [col for col in column_order if col in df.columns]
+        df = df[columns]
+        
+        df.to_csv(output_path, index=False)
+        logger.info(f"Exported {len(trades)} trades to {output_path}")
+        
+    except ImportError:
+        logger.error("pandas not installed, cannot export to CSV")
+        logger.info("Install with: pip install pandas")
 
-        # date parse
-        date_iso = ""
-        for fmt in ("%m/%d/%Y","%m/%d/%y","%m-%d-%Y","%Y-%m-%d"):
-            try:
-                date_iso = dt.datetime.strptime(date, fmt).date().isoformat()
-                break
-            except Exception:
-                pass
-        if not date_iso:
-            continue
+def export_to_parquet(trades: List[Trade], output_path: str):
+    """Export trades to Parquet file for efficient storage"""
+    try:
+        import pandas as pd
+        
+        data = [trade.to_dict() for trade in trades]
+        df = pd.DataFrame(data)
+        
+        # Convert date strings back to datetime for better Parquet compression
+        df['date'] = pd.to_datetime(df['date'])
+        
+        df.to_parquet(output_path, index=False, compression='snappy')
+        logger.info(f"Exported {len(trades)} trades to {output_path}")
+        
+    except ImportError:
+        logger.error("pandas/pyarrow not installed, cannot export to Parquet")
+        logger.info("Install with: pip install pandas pyarrow")
 
-        company, ticker = parse_asset(asset)
-        if not (ticker or company):
-            continue
+def generate_summary_statistics(trades: List[Trade]) -> dict:
+    """Generate summary statistics from trades"""
+    stats = {
+        'total_trades': len(trades),
+        'unique_actors': len(set(t.actor for t in trades)),
+        'unique_tickers': len(set(t.ticker for t in trades if t.ticker)),
+        'date_range': {
+            'earliest': min(t.date for t in trades).isoformat() if trades else None,
+            'latest': max(t.date for t in trades).isoformat() if trades else None
+        },
+        'by_action': {},
+        'by_asset_type': {},
+        'top_traded_tickers': [],
+        'largest_trades': []
+    }
+    
+    # Count by action
+    from collections import Counter
+    action_counts = Counter(t.action for t in trades)
+    stats['by_action'] = dict(action_counts)
+    
+    # Count by asset type
+    asset_type_counts = Counter(t.asset_type.value for t in trades)
+    stats['by_asset_type'] = dict(asset_type_counts)
+    
+    # Top traded tickers
+    ticker_counts = Counter(t.ticker for t in trades if t.ticker)
+    stats['top_traded_tickers'] = [
+        {'ticker': ticker, 'count': count}
+        for ticker, count in ticker_counts.most_common(10)
+    ]
+    
+    # Largest trades by upper amount
+    largest = sorted(trades, key=lambda t: t.amount_hi, reverse=True)[:10]
+    stats['largest_trades'] = [
+        {
+            'actor': t.actor,
+            'ticker': t.ticker or t.company,
+            'action': t.action,
+            'amount_range': t.amount_range,
+            'date': t.date.isoformat()
+        }
+        for t in largest
+    ]
+    
+    return stats
 
-        lo, hi, bucket = parse_amount_bucket(amount)
-        uid = row_uid("house_ptr", filing_id, len(kept)+1, ticker or company, date_iso, amount, action)
-        kept.append({
-            "event_uid": uid,
-            "filing_id": filing_id,
-            "actor": actor,
-            "date": date_iso,
-            "action": action,
-            "owner": owner,
-            "ticker": ticker,
-            "company": company,
-            "amount_range": amount,
-            "amount_lo": lo,
-            "amount_hi": hi,
-            "amount_bucket": bucket,
-            "raw": r
-        })
-    return kept
-
-# ---------- Main ----------
+# ============== Main Function ==============
 
 def main():
-    ap = argparse.ArgumentParser(description="Filter House FinancialDisclosure XML and (optionally) parse PDFs to extract trades only.")
-    ap.add_argument("--xml", required=True, help="Path to FinancialDisclosure XML (e.g., 2025FD.xml)")
-    ap.add_argument("--since", required=False, help="YYYY-MM-DD; only filings on/after this date")
-    ap.add_argument("--names", required=False, help="Semicolon-separated 'Last,First' list. If omitted, all names included.")
-    ap.add_argument("--filing-types", required=False, default="", help="Comma-separated FilingType codes (e.g., W,C,D). Empty = all.")
-    ap.add_argument("--download-and-parse", action="store_true", help="If set, download each PDF and extract trade-like rows only.")
-    ap.add_argument("--out-json", required=False, help="Write results (metadata or parsed rows) to JSON file")
-    args = ap.parse_args()
-
-    since = dt.date.fromisoformat(args.since) if args.since else None
-
-    names_list: List[Tuple[str,str]] = []
+    """Main entry point"""
+    parser = argparse.ArgumentParser(
+        description="Enhanced House Financial Disclosure Parser - Extract trades from congressional disclosures",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Parse XML only (no PDF download)
+  python %(prog)s --xml 2025FD.xml --out-json filings.json
+  
+  # Download and parse PDFs for specific members
+  python %(prog)s --xml 2025FD.xml --names "Pelosi,Nancy;McCarthy,Kevin" --download-and-parse --out-json trades.json
+  
+  # Filter by date and filing type
+  python %(prog)s --xml 2025FD.xml --since 2025-01-01 --filing-types W,C,D --download-and-parse --out-csv trades.csv
+  
+  # Generate summary statistics
+  python %(prog)s --xml 2025FD.xml --download-and-parse --summary
+        """
+    )
+    
+    # Required arguments
+    parser.add_argument('--xml', required=True, help='Path to FinancialDisclosure XML file (e.g., 2025FD.xml)')
+    
+    # Filtering options
+    parser.add_argument('--since', help='YYYY-MM-DD; only filings on/after this date')
+    parser.add_argument('--until', help='YYYY-MM-DD; only filings on/before this date')
+    parser.add_argument('--names', help='Semicolon-separated "Last,First" list (e.g., "Smith,John;Doe,Jane")')
+    parser.add_argument('--filing-types', help='Comma-separated filing type codes (e.g., W,C,D)')
+    parser.add_argument('--states', help='Comma-separated state codes (e.g., CA,TX,NY)')
+    
+    # Processing options
+    parser.add_argument('--download-and-parse', action='store_true', 
+                       help='Download PDFs and extract trades (otherwise just parse XML metadata)')
+    parser.add_argument('--cache-dir', help='Directory for caching PDFs (default: pdf_cache)')
+    parser.add_argument('--max-workers', type=int, default=5, 
+                       help='Maximum concurrent downloads (default: 5)')
+    
+    # Output options
+    parser.add_argument('--out-json', help='Output JSON file path')
+    parser.add_argument('--out-csv', help='Output CSV file path')
+    parser.add_argument('--out-parquet', help='Output Parquet file path')
+    parser.add_argument('--summary', action='store_true', help='Print summary statistics')
+    
+    # Logging options
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       default='INFO', help='Logging level')
+    parser.add_argument('--log-file', help='Log file path (in addition to stderr)')
+    
+    args = parser.parse_args()
+    
+    # Configure logging
+    logger.setLevel(getattr(logging, args.log_level))
+    if args.log_file:
+        file_handler = logging.FileHandler(args.log_file)
+        file_handler.setFormatter(
+            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        )
+        logger.addHandler(file_handler)
+    
+    # Parse dates
+    since_date = None
+    until_date = None
+    if args.since:
+        since_date = dt.date.fromisoformat(args.since)
+    if args.until:
+        until_date = dt.date.fromisoformat(args.until)
+    
+    # Parse names
+    names_list = []
     if args.names:
-        for part in args.names.split(";"):
+        for part in args.names.split(';'):
             if not part.strip():
                 continue
-            if "," in part:
-                ln, fn = part.split(",", 1)
+            if ',' in part:
+                last, first = part.split(',', 1)
             else:
-                ln, fn = part.strip(), ""
-            names_list.append((ln.strip(), fn.strip()))
-
-    types = [t.strip() for t in args.filing_types.split(",") if t.strip()]
-
+                last, first = part.strip(), ""
+            names_list.append((last.strip(), first.strip()))
+    
+    # Parse other filters
+    filing_types = [t.strip() for t in args.filing_types.split(',')] if args.filing_types else None
+    states = [s.strip().upper() for s in args.states.split(',')] if args.states else None
+    
+    # Update config
+    if args.max_workers:
+        Config.MAX_WORKERS = args.max_workers
+    
+    # Parse XML
     filings = parse_financial_disclosure_xml(args.xml)
-    filtered = filter_filings(filings, since, names_list, types)
-
-    # If not downloading, just print the metadata list with URLs
-    result = []
-    for f in filtered:
-        item = {
-            "first": f.first,
-            "last": f.last,
-            "filing_type": f.filing_type,
-            "state_dst": f.state_dst,
-            "year": f.year,
-            "filing_date": f.filing_date.isoformat(),
-            "doc_id": f.doc_id,
-            "pdf_url": f.pdf_url
-        }
-        result.append(item)
-
+    if not filings:
+        logger.error("No filings found in XML file")
+        return 1
+    
+    # Filter filings
+    filtered = filter_filings(
+        filings,
+        since=since_date,
+        until=until_date,
+        names=names_list,
+        filing_types=filing_types,
+        states=states
+    )
+    
+    logger.info(f"Filtered to {len(filtered)} filings from {len(filings)} total")
+    
     if not args.download_and_parse:
+        # Just output filing metadata
+        result = []
+        for f in filtered:
+            result.append({
+                'first': f.first,
+                'last': f.last,
+                'filing_type': f.filing_type,
+                'state_dst': f.state_dst,
+                'year': f.year,
+                'filing_date': f.filing_date.isoformat(),
+                'doc_id': f.doc_id,
+                'pdf_url': f.pdf_url
+            })
+        
         if args.out_json:
-            with open(args.out_json, "w", encoding="utf-8") as w:
-                json.dump(result, w, indent=2)
+            with open(args.out_json, 'w', encoding='utf-8') as f:
+                json.dump(result, f, indent=2)
+            logger.info(f"Saved filing metadata to {args.out_json}")
         else:
             print(json.dumps(result, indent=2))
-        return
-
-    ALL_ROWS = []
-    for f in filtered:
-        # Download primary URL; if 404, try alternate folder
-        try:
-            import requests
-            r = requests.get(f.pdf_url, timeout=30)
-            if r.status_code == 404:
-                alt_folder = "financial-pdfs" if "ptr-pdfs" in f.pdf_url else "ptr-pdfs"
-                alt_url = f"https://disclosures-clerk.house.gov/public_disc/{alt_folder}/{f.year}/{f.doc_id}.pdf"
-                r = requests.get(alt_url, timeout=30)
-                if r.status_code == 404:
-                    raise Exception("404 Not Found in both ptr-pdfs and financial-pdfs")
-                else:
-                    pdf_bytes = r.content
-                    sys.stderr.write(f"[INFO] Used fallback URL {alt_url}\n")
-            else:
-                r.raise_for_status()
-                pdf_bytes = r.content
-        except Exception as e:
-            sys.stderr.write(f"[WARN] Failed download {f.pdf_url}: {e}\n")
-            continue
-
-        norm = parse_pdf_for_trades(pdf_bytes, f.doc_id, f"{f.first} {f.last}".strip())
-        if since:
-            kept_rows = []
-            for row in norm:
-                date_txt = row.get("date", "")
-                try:
-                    row_date = dt.date.fromisoformat(date_txt)
-                except Exception:
-                    # If a row somehow lacks a parsable date, drop it when a
-                    # --since filter is provided. These rows are rare and the
-                    # caller explicitly requested a date range.
-                    continue
-                if row_date >= since:
-                    kept_rows.append(row)
-            norm = kept_rows
-        if not norm:
-            sys.stderr.write(f"[INFO] No trade-like rows found in {f.pdf_url}. Skipping.\n")
-            continue
-        ALL_ROWS.extend(norm)
-
+        
+        return 0
+    
+    # Process PDFs to extract trades
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    processor = PDFProcessor(cache_dir)
+    
+    logger.info("Starting PDF processing...")
+    trades = process_filing_batch(
+        filtered,
+        processor,
+        download_and_parse=True,
+        since_date=since_date
+    )
+    
+    logger.info(f"Extracted {len(trades)} total trades")
+    
+    # Export results
     if args.out_json:
-        with open(args.out_json, "w", encoding="utf-8") as w:
-            json.dump(ALL_ROWS, w, ensure_ascii=False, indent=2)
-    else:
-        print(json.dumps(ALL_ROWS, ensure_ascii=False, indent=2))
+        export_to_json(trades, args.out_json)
+    
+    if args.out_csv:
+        export_to_csv(trades, args.out_csv)
+    
+    if args.out_parquet:
+        export_to_parquet(trades, args.out_parquet)
+    
+    # Print summary if requested
+    if args.summary:
+        stats = generate_summary_statistics(trades)
+        print("\n" + "="*60)
+        print("SUMMARY STATISTICS")
+        print("="*60)
+        print(json.dumps(stats, indent=2))
+    
+    # If no output file specified, print to stdout
+    if not any([args.out_json, args.out_csv, args.out_parquet, args.summary]):
+        data = [trade.to_dict() for trade in trades]
+        print(json.dumps(data, indent=2))
+    
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
