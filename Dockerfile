@@ -3,6 +3,8 @@ FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
+ENV DOPPLER_TOKEN=${DOPPLER_TOKEN}
+
 WORKDIR /app
 
 # System dependencies for camelot, OpenCV and fonts
