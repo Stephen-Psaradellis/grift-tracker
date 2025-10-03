@@ -33,6 +33,10 @@ from parsing_utils import (  # noqa: E402
     parse_amount_range as _parse_amount_range,
     parse_date as _parse_date,
 )
+from normalization import (  # noqa: E402
+    collect_company_records,
+    transaction_event_from_senate_transaction,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -334,11 +338,16 @@ def run_ingest(start: dt.date, end: dt.date, output: Optional[str]) -> Dict[str,
 
     LOG.info("Collected %d transactions", len(all_transactions))
 
+    events = [transaction_event_from_senate_transaction(tx) for tx in all_transactions]
+    companies = collect_company_records(events)
+
     result = {
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
         "filings": [dataclasses.asdict(f) for f in filings],
         "transactions": [tx.to_dict() for tx in all_transactions],
+        "transaction_events": [event.to_record() for event in events],
+        "companies": [company.to_record() for company in companies],
     }
 
     if output:
@@ -354,6 +363,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", "-o", help="Path to write aggregated JSON payload")
     parser.add_argument("--log-level", default="INFO", help="Logging level (default INFO)")
     return parser
+
+
+def transactions_to_events(transactions: Sequence[SenateTransaction]) -> List[dict]:
+    """Convert raw Senate transactions to ``transaction_event`` payloads."""
+
+    events = [transaction_event_from_senate_transaction(tx) for tx in transactions]
+    return [event.to_record() for event in events]
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

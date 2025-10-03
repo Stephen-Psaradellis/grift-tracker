@@ -30,6 +30,9 @@ from parsing_utils import (  # noqa: E402
     parse_amount_range as _parse_amount_range,
     parse_date as _parse_date,
 )
+from normalization import (  # noqa: E402
+    transaction_event_from_house_trade,
+)
 
 clean_text = normalize_text
 
@@ -179,6 +182,11 @@ class Trade:
         if self.raw_data and not isinstance(self.raw_data, dict):
             d['raw_data'] = str(self.raw_data)
         return d
+
+    def to_transaction_event(self, politician_id: Optional[str] = None):
+        """Normalize the trade into a ``transaction_event`` payload."""
+
+        return transaction_event_from_house_trade(self, politician_id=politician_id)
 
 # ============== Parsing Functions ==============
 
@@ -839,6 +847,12 @@ def export_to_json(trades: List[Trade], output_path: str):
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     logger.info(f"Exported {len(trades)} trades to {output_path}")
+
+
+def trades_to_transaction_events(trades: List[Trade]) -> List[dict]:
+    """Convert trades into ``transaction_event`` payload dictionaries."""
+
+    return [trade.to_transaction_event().to_record() for trade in trades]
 
 def export_to_csv(trades: List[Trade], output_path: str):
     """Export trades to CSV file"""
